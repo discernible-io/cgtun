@@ -1,5 +1,5 @@
 [package]
-name = "cableguard-cli"
+name = "discernible-vpn-cli"
 description = "an implementation of the an implementation of the WireGuard® protocol that uses rich online digital tokens for configuration and mutual authenticationthat uses rich online digital tokens for configuration and mutual authentication"
 version = "0.92.58"
 authors = [
@@ -15,6 +15,10 @@ edition = "2021"
 readme = "README.md"
 homepage = "https://discernible.io"
 keywords = ["wireguard", "vpn", "blockchain"]
+
+[[bin]]
+name = "discernible-vpn"
+path = "src/main.rs"
 
 [dependencies]
 daemonize = "0.5.0"
@@ -36,7 +40,7 @@ hex = "0.4.3"
 sha2 = "0.10.7"
 zeroize= "1.5.0"
 
-[dependencies.cableguard]
+[dependencies.discernible-vpn]
 version = "0.92.58"
-path = "../cableguard"
+path = "../discernible-vpn"
 features = ["device"]

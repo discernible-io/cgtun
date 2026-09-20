@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use clap::{Arg, Command};
-use cableguard::device::{DeviceConfig, DeviceHandle,ed2x_private_key_bytes,skx2pkx};
-use cableguard::noise::Rodit;
-use cableguard::device::api::{nearorg_rpc_tokens_for_owner,nearorg_rpc_state};
-use cableguard::noise::constants::{SMART_CONTRACT,BLOCKCHAIN_NETWORK};
-use cableguard::device::drop_privileges::drop_privileges;
+use discernible_vpn::device::{DeviceConfig, DeviceHandle,ed2x_private_key_bytes,skx2pkx};
+use discernible_vpn::noise::Rodit;
+use discernible_vpn::device::api::{nearorg_rpc_tokens_for_owner,nearorg_rpc_state};
+use discernible_vpn::noise::constants::{SMART_CONTRACT,BLOCKCHAIN_NETWORK};
+use discernible_vpn::device::drop_privileges::drop_privileges;
 // use daemonize::Daemonize;
 use daemonize::{Daemonize, Outcome};
 use base64::encode as base64encode;
@@ -20,7 +20,7 @@ use std::env;
 use tracing::{Level};
 
 fn main() {
-    let matches = Command::new("cableguard")
+    let matches = Command::new("discernible-vpn")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Discernible IO and Vlad Krasnov <vlad@cloudflare.com> et al, based on Wireguard (C) by Jason Donefeld")
         .args(&[
@@ -65,7 +65,7 @@ fn main() {
                 .short('l')
                 .env("WG_LOG_FILE")
                 .help("Log file")
-                .default_value("/tmp/cableguard.out"),
+                .default_value("/tmp/discernible-vpn.out"),
             Arg::new("disable-drop-privileges")
                 .long("disable-drop-privileges")
                 .env("WG_SUDO")

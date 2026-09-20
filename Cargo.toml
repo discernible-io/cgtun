@@ -1,5 +1,5 @@
 [workspace]
-members = ["cableguard", "cableguard-cli"]
+members = ["discernible-vpn", "discernible-vpn-cli"]
 resolver = "2"
 
 [profile.release]

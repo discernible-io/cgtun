@@ -6,7 +6,7 @@ privatekey
 publickey
 dev-account
 Cargo.lock
-/cableguard/Cargo.lock
-/cableguard-cli/Cargo.lock
+/discernible-vpn/Cargo.lock
+/discernible-vpn-cli/Cargo.lock
 output.txt
 

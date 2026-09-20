@@ -1,5 +1,5 @@
 [package]
-name = "cableguard"
+name = "discernible-vpn"
 description = "an implementation of the WireGuard® protocol that uses rich online digital tokens for configuration and mutual authentication"
 version = "0.92.58"
 authors = [
