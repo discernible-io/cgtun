@@ -75,3 +75,9 @@ NAT traversal and optional DERP relay support. Endpoint trust stays with RODiT a
 
 ---
 <sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. Discernible IO is not sponsored or endorsed by Jason A. Donenfeld.</sub></sub></sub></sub>
+
+<!-- discernible-io:product-links -->
+---
+
+[discernible.io](https://www.discernible.io/) · [Get a Passport](https://purchase.identyclaw.com) · [Verify HOLA](https://verify.identyclaw.com)
+<!-- /discernible-io:product-links -->
