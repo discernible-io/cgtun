@@ -12,7 +12,7 @@ use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -169,6 +169,11 @@ pub struct Device {
     cleanup_paths: Vec<String>,
     mtu: AtomicUsize,
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Set when the device is shutting down; UAPI handlers must not mutate after this.
+    is_closed: AtomicBool,
+    /// Serializes UAPI `set` against teardown (wireguard-go ipcMutex).
+    /// `Arc` so handlers can lock without borrowing `Device`.
+    ipc_mutex: Arc<Mutex<()>>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -273,14 +278,14 @@ impl DeviceHandle {
                             Action::Continue => {}
                             Action::Yield => break,
                             Action::Exit => {
-                                device_lock.trigger_exit();
+                                device_lock.close();
                                 return;
                             }
                         }
                     }
                     WaitResult::EoF(handler) => {
                         if uapi_fd >= 0 && uapi_fd == handler.fd() {
-                            device_lock.trigger_exit();
+                            device_lock.close();
                             return;
                         }
                         handler.cancel();
@@ -294,7 +299,11 @@ impl DeviceHandle {
 
 impl Drop for DeviceHandle {
     fn drop(&mut self) {
-        self.device.read().trigger_exit();
+        // Mark closed and wake workers, then join so in-flight UAPI finishes before cleanup.
+        self.device.read().close();
+        while let Some(thread) = self.threads.pop() {
+            let _ = thread.join();
+        }
         self.clean();
     }
 }
@@ -416,6 +425,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            is_closed: AtomicBool::new(false),
+            ipc_mutex: Arc::new(Mutex::new(())),
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -708,6 +719,25 @@ impl Device {
     pub(crate) fn trigger_exit(&self) {
         self.queue
             .trigger_notification(self.exit_notice.as_ref().unwrap())
+    }
+
+    /// Begin device shutdown: set closed under the IPC lock, then wake event loops.
+    /// Mirrors wireguard-go taking ipcMutex for the duration of Close.
+    pub(crate) fn close(&self) {
+        let ipc = self.ipc_mutex();
+        let _ipc = ipc.lock();
+        if self.is_closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.trigger_exit();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn ipc_mutex(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.ipc_mutex)
     }
 
     pub(crate) fn cancel_yield(&self) {

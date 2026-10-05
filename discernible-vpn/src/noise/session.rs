@@ -3,16 +3,17 @@
 
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
+use crate::noise::timers::REJECT_AFTER_MESSAGES;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
     receiver: LessSafeKey,
     sender: LessSafeKey,
-    sending_key_counter: AtomicUsize,
+    sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
 }
 
@@ -30,13 +31,20 @@ impl std::fmt::Debug for Session {
 const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
 const AEAD_SIZE: usize = 16;
+/// Transport plaintext is padded to a multiple of this many bytes (wireguard-go / kernel).
+const PADDING_MULTIPLE: usize = 16;
 
-// Receiving buffer constants
+// Receiving buffer constants — 8192-bit window matches wireguard-go (fq_codel reordering).
 const WORD_SIZE: u64 = 64;
-const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+const N_WORDS: u64 = 128; // 64 * 128 = 8192 packets
 const N_BITS: u64 = WORD_SIZE * N_WORDS;
 
-#[derive(Debug, Clone, Default)]
+#[inline]
+fn padding_len(packet_size: usize) -> usize {
+    (PADDING_MULTIPLE - (packet_size % PADDING_MULTIPLE)) % PADDING_MULTIPLE
+}
+
+#[derive(Debug, Clone)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
@@ -44,6 +52,16 @@ struct ReceivingKeyCounterValidator {
     /// Used to estimate packet loss
     receive_cnt: u64,
     bitmap: [u64; N_WORDS as usize],
+}
+
+impl Default for ReceivingKeyCounterValidator {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            receive_cnt: 0,
+            bitmap: [0u64; N_WORDS as usize],
+        }
+    }
 }
 
 impl ReceivingKeyCounterValidator {
@@ -83,6 +101,9 @@ impl ReceivingKeyCounterValidator {
     /// Returns true if the counter was not yet received, and is not too far back
     #[inline(always)]
     fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(WireGuardError::InvalidCounter);
+        }
         if counter >= self.next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -102,6 +123,9 @@ impl ReceivingKeyCounterValidator {
     /// decryption something changed)
     #[inline(always)]
     fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(WireGuardError::InvalidCounter);
+        }
         if counter + N_BITS < self.next {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
@@ -165,13 +189,18 @@ impl Session {
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
             ),
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
-            sending_key_counter: AtomicUsize::new(0),
+            sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
         }
     }
 
     pub(super) fn local_index(&self) -> usize {
         self.receiving_index as usize
+    }
+
+    /// Current sending nonce/counter (next value that will be used).
+    pub(super) fn sending_counter(&self) -> u64 {
+        self.sending_key_counter.load(Ordering::Relaxed)
     }
 
     /// Returns true if receiving counter is good to use
@@ -194,11 +223,13 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
     pub(super) fn produce_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+        let pad = padding_len(src.len());
+        let plaintext_len = src.len() + pad;
+        if dst.len() < DATA_OFFSET + plaintext_len + AEAD_SIZE {
             panic!("The destination buffer is too small");
         }
 
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (own_index, rest) = rest.split_at_mut(4);
@@ -208,20 +239,23 @@ impl Session {
         own_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
+        // Pad plaintext to a multiple of 16 bytes per the WireGuard spec.
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
+            if pad > 0 {
+                data[src.len()..plaintext_len].fill(0);
+            }
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..plaintext_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[plaintext_len..plaintext_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    plaintext_len + AEAD_SIZE
                 })
                 .unwrap()
         };
@@ -325,5 +359,24 @@ mod tests {
         assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    }
+
+    #[test]
+    fn test_padding_len() {
+        assert_eq!(padding_len(0), 0);
+        assert_eq!(padding_len(1), 15);
+        assert_eq!(padding_len(15), 1);
+        assert_eq!(padding_len(16), 0);
+        assert_eq!(padding_len(17), 15);
+        assert_eq!(padding_len(32), 0);
+    }
+
+    #[test]
+    fn test_reject_after_messages() {
+        let c: ReceivingKeyCounterValidator = Default::default();
+        assert!(matches!(
+            c.will_accept(REJECT_AFTER_MESSAGES),
+            Err(WireGuardError::InvalidCounter)
+        ));
     }
 }

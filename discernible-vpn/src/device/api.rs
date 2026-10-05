@@ -200,6 +200,9 @@ impl Device {
         self.queue.new_event(
             api_listener.as_raw_fd(),
             Box::new(move |thisnetworkdevice, _| {
+                if thisnetworkdevice.is_closed() {
+                    return Action::Exit;
+                }
                 // This is the closure that listens on the api unix socket
                 let (api_conn, _) = match api_listener.accept() {
                     Ok(conn) => conn,
@@ -234,6 +237,9 @@ impl Device {
         self.queue.new_event(
             io_file.as_raw_fd(),
             Box::new(move |thisnetworkdevice, _| {
+                if thisnetworkdevice.is_closed() {
+                    return Action::Exit;
+                }
                 // This is the closure that listens on the api file descriptor
                 let mut readerbufferdevice = BufReader::new(&io_file);
                 let mut writerbufferdevice = BufWriter::new(&io_file);
@@ -249,7 +255,7 @@ impl Device {
                     writeln!(writerbufferdevice, "errno={}\n", status).ok();
                 } else {
                     // The remote side is likely closed; we should trigger an exit.
-                    thisnetworkdevice.trigger_exit();
+                    thisnetworkdevice.close();
                     return Action::Exit;
                 }
                 Action::Continue // Indicates the worker thread should continue as normal
@@ -271,7 +277,7 @@ impl Device {
                 // TODO: Could this be an issue if we restart the service too quickly?
                 let path = std::path::Path::new(&path);
                 if !path.exists() {
-                    thisnetworkdevice.trigger_exit();
+                    thisnetworkdevice.close();
                     return Action::Exit;
                 }
 
@@ -301,6 +307,9 @@ impl Device {
 
 #[allow(unused_must_use)]
 fn api_get(writerbufferdevice: &mut BufWriter<&UnixStream>, thisnetworkdevice: &Device) -> i32 {
+    if thisnetworkdevice.is_closed() {
+        return EBUSY;
+    }
     // get command requires an empty line, but there is no reason to be religious about it
     if let Some(ref own_static_key_pair) = thisnetworkdevice.key_pair {
         writeln!(writerbufferdevice, "own_public_key={}", encode_hex(own_static_key_pair.1.as_bytes()));
@@ -363,6 +372,12 @@ fn api_set(readerbufferdevice: &mut BufReader<&UnixStream>, d: &mut LockReadGuar
         |device| device.trigger_yield(),
         |device| {
             device.cancel_yield();
+            // Hold IPC lock for the duration of the set, matching wireguard-go.
+            let ipc = device.ipc_mutex();
+            let _ipc = ipc.lock();
+            if device.is_closed() {
+                return EBUSY;
+            }
 
             let mut cmd = String::new();
 

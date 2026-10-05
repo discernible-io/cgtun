@@ -312,8 +312,17 @@ impl Tunn {
         rodit_id[..rodit_length].copy_from_slice(&bytes_rodit_id[..rodit_length]);
         rodit_id[rodit_length] = 0;
 
+        // Capture Instant and UNIX time together so handshake TAI64N and tunnel timers share a base.
+        #[cfg(not(feature = "mock-instant"))]
+        let now = crate::sleepyinstant::Instant::now();
+        #[cfg(feature = "mock-instant")]
+        let now = mock_instant::Instant::now();
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+
         let tunn = Tunn {
-            handshake: Handshake::new(
+            handshake: Handshake::new_at(
                 static_private,
                 static_public,
                 peer_static_public,
@@ -321,6 +330,8 @@ impl Tunn {
                 preshared_key,
                 rodit_id,
                 rodit_id_signature,
+                now,
+                unix,
             )
             .map_err(|_| "Error: Invalid parameters")?,
             own_serviceproviderid: serviceproviderid,
@@ -329,7 +340,7 @@ impl Tunn {
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
             packet_queue: VecDeque::new(),
-            timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
+            timers: Timers::new_at(persistent_keepalive, rate_limiter.is_none(), now),
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
@@ -365,6 +376,11 @@ impl Tunn {
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            // Reject sending once the session message counter is exhausted (wireguard-go).
+            if session.sending_counter() >= timers::REJECT_AFTER_MESSAGES {
+                self.queue_packet(src);
+                return self.produce_handshake_initiation(dst, false);
+            }
             // Send the packet using an established session
             let packet = session.produce_packet_data(src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
@@ -762,11 +778,33 @@ mod tests {
         let my_index = OsRng.next_u32();
 
         let their_staticsecret_private_key = x25519::StaticSecret::random_from_rng(OsRng);
-        let their_publickey_public_key = x25519::PublicKey::from(&their_secret_key);
+        let their_publickey_public_key = x25519::PublicKey::from(&their_staticsecret_private_key);
         let their_index = OsRng.next_u32();
 
-        let my_tun = Tunn::new(own_staticsecret_private_key, their_publickey_public_key, None, None, my_index, None).unwrap();
-        let their_tun = Tunn::new(their_staticsecret_private_key, own_publickey_public_key, None, None, their_index, None);
+        let my_tun = Tunn::new(
+            own_staticsecret_private_key,
+            their_publickey_public_key,
+            None,
+            String::from("test-rodit-a"),
+            String::from("test-sp"),
+            [0u8; RODIT_ID_SIGNATURE_SZ],
+            None,
+            my_index,
+            None,
+        )
+        .unwrap();
+        let their_tun = Tunn::new(
+            their_staticsecret_private_key,
+            own_publickey_public_key,
+            None,
+            String::from("test-rodit-b"),
+            String::from("test-sp"),
+            [0u8; RODIT_ID_SIGNATURE_SZ],
+            None,
+            their_index,
+            None,
+        )
+        .unwrap();
 
         (my_tun, their_tun)
     }

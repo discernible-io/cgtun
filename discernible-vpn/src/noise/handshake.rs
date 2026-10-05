@@ -4,6 +4,7 @@
 use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
+use crate::noise::timers::rekey_timeout_with_jitter;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
@@ -168,20 +169,30 @@ struct Tai64N {
 }
 
 #[derive(Debug)]
-/// This struct computes a [Tai64N](https://cr.yp.to/libtai/tai64.html) timestamp from current system time
+/// This struct computes a [Tai64N](https://cr.yp.to/libtai/tai64.html) timestamp from a fixed
+/// (Instant, UNIX) base captured at construction. Keeping the base pure w.r.t. start time avoids
+/// inconsistent handshake timestamps when a `Tunn`/`Handshake` is recreated for the same key.
 struct TimeStamper {
     duration_at_start: Duration,
     instant_at_start: Instant,
 }
 
 impl TimeStamper {
-    /// Create a new TimeStamper
+    /// Create a new TimeStamper using the current clocks.
     pub fn new() -> TimeStamper {
-        TimeStamper {
-            duration_at_start: SystemTime::now()
+        Self::new_at(
+            Instant::now(),
+            SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap(),
-            instant_at_start: Instant::now(),
+        )
+    }
+
+    /// Create a TimeStamper from an explicit Instant/UNIX pair taken together by the caller.
+    pub fn new_at(instant_at_start: Instant, duration_at_start: Duration) -> TimeStamper {
+        TimeStamper {
+            duration_at_start,
+            instant_at_start,
         }
     }
 
@@ -263,6 +274,8 @@ struct HandshakeInitSentState {
     chaining_key: [u8; KEY_LEN],
     ephemeral_private: x25519::ReusableSecret,
     time_sent: Instant,
+    /// REKEY_TIMEOUT + jitter; armed once when this initiation is sent.
+    retransmit_after: Duration,
 }
 
 impl std::fmt::Debug for HandshakeInitSentState {
@@ -273,6 +286,7 @@ impl std::fmt::Debug for HandshakeInitSentState {
             .field("chaining_key", &self.chaining_key)
             .field("ephemeral_private", &"<redacted>")
             .field("time_sent", &self.time_sent)
+            .field("retransmit_after", &self.retransmit_after)
             .finish()
     }
 }
@@ -305,7 +319,6 @@ pub struct Handshake {
     cookies: Cookies,
     /// The timestamp of the last handshake we received
     last_handshake_timestamp: Tai64N,
-    // TODO: make TimeStamper a singleton
     stamper: TimeStamper,
     pub(super) last_rtt: Option<u32>,
 }
@@ -424,6 +437,34 @@ impl Handshake {
         rodit_id: [u8; RODIT_ID_SZ],
         rodit_id_signature: [u8; RODIT_ID_SIGNATURE_SZ],
     ) -> Result<Handshake, WireGuardError> {
+        let now = Instant::now();
+        let unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        Self::new_at(
+            static_private,
+            static_public,
+            peer_static_public,
+            global_index,
+            preshared_key,
+            rodit_id,
+            rodit_id_signature,
+            now,
+            unix,
+        )
+    }
+
+    pub(crate) fn new_at(
+        static_private: x25519::StaticSecret,
+        static_public: x25519::PublicKey,
+        peer_static_public: x25519::PublicKey,
+        global_index: u32,
+        preshared_key: Option<[u8; 32]>,
+        rodit_id: [u8; RODIT_ID_SZ],
+        rodit_id_signature: [u8; RODIT_ID_SIGNATURE_SZ],
+        instant_at_start: Instant,
+        unix_at_start: Duration,
+    ) -> Result<Handshake, WireGuardError> {
         let params = NoiseParams::new(
             static_private,
             static_public,
@@ -439,7 +480,7 @@ impl Handshake {
             previous: HandshakeState::None,
             state: HandshakeState::None,
             last_handshake_timestamp: Tai64N::zero(),
-            stamper: TimeStamper::new(),
+            stamper: TimeStamper::new_at(instant_at_start, unix_at_start),
             cookies: Default::default(),
             last_rtt: None,
         })
@@ -453,6 +494,18 @@ impl Handshake {
         match self.state {
             HandshakeState::InitSent(HandshakeInitSentState { time_sent, .. }) => Some(time_sent),
             _ => None,
+        }
+    }
+
+    /// True when an initiation was sent and REKEY_TIMEOUT + jitter has elapsed.
+    pub(crate) fn should_retransmit_initiation(&self) -> bool {
+        match self.state {
+            HandshakeState::InitSent(HandshakeInitSentState {
+                time_sent,
+                retransmit_after,
+                ..
+            }) => time_sent.elapsed() >= retransmit_after,
+            _ => false,
         }
     }
 
@@ -835,6 +888,7 @@ impl Handshake {
                 hash,
                 ephemeral_private,
                 time_sent: time_now,
+                retransmit_after: rekey_timeout_with_jitter(),
             }),
         );
 

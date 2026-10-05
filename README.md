@@ -29,8 +29,8 @@ You may want to add to .bashrc these lines:
 - export BLOCKCHAIN_ENV=testnet (for testnet, mainnet for mainnet)
 
 ## How to Install from .deb package
-wget https://discernible-vpn.fra1.digitaloceanspaces.com/discernible-vpn_0.89.99_amd64.deb
-sudo apt install ./discernible-vpn_0.92.58_amd64.deb
+wget https://discernible-vpn.fra1.digitaloceanspaces.com/discernible-vpn_0.92.59_amd64.deb
+sudo apt install ./discernible-vpn_0.92.59_amd64.deb
 
 ## How to Use
 To start a tunnel use:

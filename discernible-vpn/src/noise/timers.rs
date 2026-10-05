@@ -3,6 +3,7 @@
 
 use super::errors::WireGuardError;
 use crate::noise::{Tunn, TunnResult};
+use rand_core::{OsRng, RngCore};
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::time::Duration;
@@ -19,8 +20,21 @@ pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Random jitter added to rekey/retransmit timers, matching wireguard-go.
+pub(crate) const REKEY_TIMEOUT_JITTER_MAX_MS: u32 = 334;
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
+
+/// Initiate a new handshake after this many messages on a session (wireguard-go / kernel).
+pub(crate) const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
+/// Reject data messages once the sending/receiving counter reaches this (wireguard-go / kernel).
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
+
+/// REKEY_TIMEOUT plus a random jitter in `[0, REKEY_TIMEOUT_JITTER_MAX_MS)`.
+pub(crate) fn rekey_timeout_with_jitter() -> Duration {
+    let jitter_ms = OsRng.next_u32() % REKEY_TIMEOUT_JITTER_MAX_MS;
+    REKEY_TIMEOUT + Duration::from_millis(u64::from(jitter_ms))
+}
 
 #[derive(Debug)]
 pub enum TimerName {
@@ -59,6 +73,9 @@ pub struct Timers {
     want_keepalive: bool,
     /// Did we send data without hearing back?
     want_handshake: bool,
+    /// Absolute time (since `time_started`) when a new handshake should be attempted
+    /// after sending data without a reply. Includes rekey jitter, armed once per send.
+    new_handshake_at: Option<Duration>,
     persistent_keepalive: usize,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
@@ -66,19 +83,28 @@ pub struct Timers {
 
 impl Timers {
     pub(super) fn new(persistent_keepalive: Option<u16>, reset_rr: bool) -> Timers {
+        Self::new_at(persistent_keepalive, reset_rr, Instant::now())
+    }
+
+    pub(super) fn new_at(
+        persistent_keepalive: Option<u16>,
+        reset_rr: bool,
+        time_started: Instant,
+    ) -> Timers {
         Timers {
             is_initiator: false,
-            time_started: Instant::now(),
+            time_started,
             timers: Default::default(),
             session_timers: Default::default(),
             want_keepalive: Default::default(),
             want_handshake: Default::default(),
+            new_handshake_at: None,
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             should_reset_rr: reset_rr,
         }
     }
 
-    fn is_initiator(&self) -> bool {
+    pub(super) fn is_initiator(&self) -> bool {
         self.is_initiator
     }
 
@@ -91,6 +117,7 @@ impl Timers {
         }
         self.want_handshake = false;
         self.want_keepalive = false;
+        self.new_handshake_at = None;
     }
 }
 
@@ -113,10 +140,15 @@ impl Tunn {
             TimeLastPacketReceived => {
                 self.timers.want_keepalive = true;
                 self.timers.want_handshake = false;
+                self.timers.new_handshake_at = None;
             }
             TimeLastPacketSent => {
                 self.timers.want_handshake = true;
                 self.timers.want_keepalive = false;
+                // Arm once with jitter, matching wireguard-go timersDataSent.
+                let now = Instant::now().duration_since(self.timers.time_started);
+                self.timers.new_handshake_at =
+                    Some(now + KEEPALIVE_TIMEOUT + rekey_timeout_with_jitter());
             }
             _ => {}
         }
@@ -184,7 +216,7 @@ impl Tunn {
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
         let handshake_started = self.timers[TimeLastHandshakeStarted];
-        let aut_packet_received = self.timers[TimeLastPacketReceived];
+        let _aut_packet_received = self.timers[TimeLastPacketReceived];
         let aut_packet_sent = self.timers[TimeLastPacketSent];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
@@ -211,7 +243,7 @@ impl Tunn {
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
 
-            if let Some(time_init_sent) = self.handshake.timer() {
+            if self.handshake.timer().is_some() {
                 // Handshake Initiation Retransmission
                 if now - handshake_started >= REKEY_ATTEMPT_TIME {
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
@@ -224,16 +256,14 @@ impl Tunn {
                     return TunnResult::Err(WireGuardError::ConnectionExpired);
                 }
 
-                if time_init_sent.elapsed() >= REKEY_TIMEOUT {
-                    // We avoid using `time` here, because it can be earlier than `time_init_sent`.
-                    // Once `checked_duration_since` is stable we can use that.
-                    // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
-                    // if a response has not been received, where jitter is some random
-                    // value between 0 and 333 ms.
+                // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
+                // if a response has not been received, where jitter is some random
+                // value between 0 and REKEY_TIMEOUT_JITTER_MAX_MS ms.
+                if self.handshake.should_retransmit_initiation() {
                     tracing::debug!("Info: HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }
-            } else {
+            } else if !self.handshake.is_in_progress() {
                 if self.timers.is_initiator() {
                     // After sending a packet, if the sender was the original initiator
                     // of the handshake and if the current session key is REKEY_AFTER_TIME
@@ -262,17 +292,25 @@ impl Tunn {
                         );
                         handshake_initiation_required = true;
                     }
+
+                    // Message-count based rekey (wireguard-go keepKeyFreshSending).
+                    if let Some(session) = &self.sessions[self.current % super::N_SESSIONS] {
+                        if session.sending_counter() > REKEY_AFTER_MESSAGES {
+                            tracing::debug!("Info: HANDSHAKE(REKEY_AFTER_MESSAGES)");
+                            handshake_initiation_required = true;
+                        }
+                    }
                 }
 
                 // If we have sent a packet to a given peer but have not received a
-                // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms,
+                // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT + jitter) ms,
                 // we initiate a new handshake.
-                if data_packet_sent > aut_packet_received
-                    && now - aut_packet_received >= KEEPALIVE_TIMEOUT + REKEY_TIMEOUT
-                    && mem::replace(&mut self.timers.want_handshake, false)
-                {
-                    tracing::debug!("Info: HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
-                    handshake_initiation_required = true;
+                if let Some(deadline) = self.timers.new_handshake_at {
+                    if now >= deadline && mem::replace(&mut self.timers.want_handshake, false) {
+                        self.timers.new_handshake_at = None;
+                        tracing::debug!("Info: HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
+                        handshake_initiation_required = true;
+                    }
                 }
 
                 if !handshake_initiation_required {

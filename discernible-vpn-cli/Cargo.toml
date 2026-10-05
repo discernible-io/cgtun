@@ -1,7 +1,7 @@
 [package]
 name = "discernible-vpn-cli"
 description = "an implementation of the an implementation of the WireGuard® protocol that uses rich online digital tokens for configuration and mutual authenticationthat uses rich online digital tokens for configuration and mutual authentication"
-version = "0.92.58"
+version = "0.92.59"
 authors = [
     "Discernible IO",
     "Noah Kennedy <nkennedy@cloudflare.com>",
@@ -10,7 +10,7 @@ authors = [
 ]
 license = "BSD-3-Clause"
 repository = "https://github.com/discernible-io/cgtun"
-documentation = "https://docs.rs/cgtun/0.92.58/cgtun/"
+documentation = "https://docs.rs/cgtun/0.92.59/cgtun/"
 edition = "2021"
 readme = "README.md"
 homepage = "https://discernible.io"
@@ -26,6 +26,8 @@ clap = { version = "3.1.6", features = ["env"] }
 tracing = "0.1.31"
 tracing-subscriber = "0.3.9"
 tracing-appender = "0.2.1"
+# tracing-appender 0.2.x resolves time 0.3.29 by default; that version fails on rustc 1.95+.
+time = "0.3.36"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bs58 = "0.5.0"
@@ -41,6 +43,6 @@ sha2 = "0.10.7"
 zeroize= "1.5.0"
 
 [dependencies.discernible-vpn]
-version = "0.92.58"
+version = "0.92.59"
 path = "../discernible-vpn"
 features = ["device"]
