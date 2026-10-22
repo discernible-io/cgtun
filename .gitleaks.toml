@@ -1,0 +1,4 @@
+title = "cgtun gitleaks config"
+
+[extend]
+useDefault = true
