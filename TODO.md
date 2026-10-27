@@ -20,3 +20,14 @@ NAT traversal and optional DERP relay support. Endpoint trust stays with RODiT a
 - [ ] Optional relay abuse controls without Tailscale `--verify-clients` (RODiT-aware gate or private map); do not introduce client certificates for peer trust
 - [ ] Integration tests for pierce success, DERP fallback, and upgrade-to-direct
 - [ ] Document the NAT/DERP model in this README (trust vs reachability vs relay TLS)
+
+
+## Standards conformance gaps (host audit 2026-10-27)
+
+Thin Rust tooling (not a containerized API). Score lightly per applicability matrix.
+
+| Gap | Standard | Notes |
+| --- | --- | --- |
+| README → standards | documentation | Add reference-only link to discernible-io/docs (coding / vocabulary where code is touched) |
+| Coding / Rust gates | coding **PI 12** | When CI is added: `rust-toolchain.toml` already present — adopt fmt/clippy/`cargo deny` and deterministic `TZ`/`LANG` on the default test job |
+| Gitleaks | cicd | `.gitleaks.toml` present; no workflow yet — optional until publish path exists |
